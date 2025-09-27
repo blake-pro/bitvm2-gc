@@ -1,6 +1,8 @@
 //! Module provides a way to build binary circuits
 use crate::bag::*;
-use crate::circuits::sect233k1::curve_ckt::{CurvePoint, template_emit_point_add};
+use crate::circuits::sect233k1::curve_ckt::{
+    CurvePoint, template_emit_point_add, template_emit_point_add_mixed,
+};
 use crate::circuits::sect233k1::gf_ckt::GF_LEN;
 use crate::core::gate::Gate;
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ pub enum Operation<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CustomGateType {
     PointAdd,
+    PointAddMixed,
     // add more type here e.g fr_mul when needed for memory balance
 }
 
@@ -42,6 +45,7 @@ impl fmt::Display for CustomGateType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CustomGateType::PointAdd => write!(f, "PointAdd"),
+            CustomGateType::PointAddMixed => write!(f, "PointAddMixed"),
         }
     }
 }
@@ -156,6 +160,7 @@ impl Default for CircuitAdapter {
 #[derive(Default, Debug)]
 pub struct Templates {
     pub ptadd_template: Option<Template>,
+    pub ptadd_mixed_template: Option<Template>,
 }
 
 /// Aggregated gate statistics for a circuit build.
@@ -431,7 +436,10 @@ impl CircuitTrait for CircuitAdapter {
     fn gate_counts(&self) -> GateCounts {
         let mut counts = GateCounts::default();
         let point_add_stats = self.get_template(CustomGateType::PointAdd).map(|tmpl| tmpl.stats);
+        let point_add_mixed_stats =
+            self.get_template(CustomGateType::PointAddMixed).map(|tmpl| tmpl.stats);
         let mut point_add_count = 0usize;
+        let mut point_add_mixed_count = 0usize;
 
         for gate in self.get_gates() {
             match gate {
@@ -443,8 +451,13 @@ impl CircuitTrait for CircuitAdapter {
                 },
                 GateOperation::Custom(params) => {
                     counts.custom += 1;
-                    if let CustomGateType::PointAdd = params.gate_type {
-                        point_add_count += 1;
+                    match params.gate_type {
+                        CustomGateType::PointAdd => {
+                            point_add_count += 1;
+                        }
+                        CustomGateType::PointAddMixed => {
+                            point_add_mixed_count += 1;
+                        }
                     }
                 }
             }
@@ -454,6 +467,12 @@ impl CircuitTrait for CircuitAdapter {
             counts.custom_and = and * point_add_count;
             counts.custom_xor = xor * point_add_count;
             counts.custom_or = or * point_add_count;
+        }
+
+        if let Some((and, xor, or)) = point_add_mixed_stats {
+            counts.custom_and += and * point_add_mixed_count;
+            counts.custom_xor += xor * point_add_mixed_count;
+            counts.custom_or += or * point_add_mixed_count;
         }
 
         counts
@@ -471,13 +490,23 @@ impl CircuitTrait for CircuitAdapter {
                     self.templates.ptadd_template = Some(template);
                 }
             }
+            CustomGateType::PointAddMixed => {
+                if self.templates.ptadd_mixed_template.is_none() {
+                    let template = template_emit_point_add_mixed();
+                    self.templates.ptadd_mixed_template = Some(template);
+                }
+            }
         }
-        self.templates.ptadd_template.as_ref().unwrap()
+        match templ_type {
+            CustomGateType::PointAdd => self.templates.ptadd_template.as_ref().unwrap(),
+            CustomGateType::PointAddMixed => self.templates.ptadd_mixed_template.as_ref().unwrap(),
+        }
     }
 
     fn get_template(&self, templ_type: CustomGateType) -> Option<&Template> {
         match templ_type {
             CustomGateType::PointAdd => self.templates.ptadd_template.as_ref(),
+            CustomGateType::PointAddMixed => self.templates.ptadd_mixed_template.as_ref(),
         }
     }
 }
@@ -565,6 +594,33 @@ impl Template {
         let output_wires = Self::emit_custom(bld, input_wires, CustomGateType::PointAdd);
 
         // Deserialize wire indexes into expected data structure
+        CurvePoint {
+            x: output_wires[0..GF_LEN].try_into().unwrap(),
+            s: output_wires[GF_LEN..GF_LEN * 2].try_into().unwrap(),
+            z: output_wires[GF_LEN * 2..GF_LEN * 3].try_into().unwrap(),
+            t: output_wires[GF_LEN * 3..GF_LEN * 4].try_into().unwrap(),
+        }
+    }
+
+    /// Generate binary circuit for mixed point addition (projective + affine)
+    pub fn emit_point_add_mixed_custom<T: CircuitTrait>(
+        bld: &mut T,
+        p1: &CurvePoint,
+        p2: &CurvePoint,
+    ) -> CurvePoint {
+        let mut input_wires = vec![];
+        input_wires.extend_from_slice(&p1.x);
+        input_wires.extend_from_slice(&p1.s);
+        input_wires.extend_from_slice(&p1.z);
+        input_wires.extend_from_slice(&p1.t);
+
+        input_wires.extend_from_slice(&p2.x);
+        input_wires.extend_from_slice(&p2.s);
+        input_wires.extend_from_slice(&p2.z);
+        input_wires.extend_from_slice(&p2.t);
+
+        let output_wires = Self::emit_custom(bld, input_wires, CustomGateType::PointAddMixed);
+
         CurvePoint {
             x: output_wires[0..GF_LEN].try_into().unwrap(),
             s: output_wires[GF_LEN..GF_LEN * 2].try_into().unwrap(),
@@ -717,6 +773,9 @@ impl CircuitAdapter {
                 GateOperation::Custom(params) => {
                     let custom_gate_template = match params.gate_type {
                         CustomGateType::PointAdd => self.templates.ptadd_template.as_ref().unwrap(),
+                        CustomGateType::PointAddMixed => {
+                            self.templates.ptadd_mixed_template.as_ref().unwrap()
+                        }
                     };
                     let gates = custom_gate_template.unroll_custom_gate(
                         zero_gate,

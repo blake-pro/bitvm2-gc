@@ -164,6 +164,42 @@ pub(crate) fn emit_point_add<T: CircuitTrait>(
     CurvePoint { x: p3_x, s: p3_s, z: p3_z, t: p3_t }
 }
 
+/// Add points when the second operand is in affine form (Z = 1).
+///
+/// This variant avoids computing products with the affine Z coordinate and
+/// reuses the fact that `T₂ = X₂` to shave one field multiplication compared to
+/// the fully projective formula.
+pub(crate) fn emit_point_add_mixed<T: CircuitTrait>(
+    bld: &mut T,
+    p1: &CurvePoint,
+    p2: &CurvePoint,
+) -> CurvePoint {
+    // Step 1: Calculate products that remain non-trivial in the mixed setting
+    let x1x2 = emit_gf_mul(bld, &p1.x, &p2.x);
+    let s1s2 = emit_gf_mul(bld, &p1.s, &p2.s);
+
+    // Step 2: Calculate d = (S1 + T1)*(S2 + T2)
+    let tmp1 = emit_gf_add(bld, &p1.s, &p1.t);
+    let tmp2 = emit_gf_add(bld, &p2.s, &p2.t);
+    let d = emit_gf_mul(bld, &tmp1, &tmp2);
+
+    // Step 3: Calculate squares
+    let f = emit_gf_square(bld, &x1x2);
+    let g = emit_gf_square(bld, &p1.z);
+
+    // Step 4: Calculate output coordinates
+    let p3_x = emit_gf_add(bld, &d, &s1s2);
+
+    let tmp1 = emit_gf_mul(bld, &s1s2, &g);
+    let tmp2 = emit_gf_mul(bld, &d, &f);
+    let p3_s = emit_gf_add(bld, &tmp1, &tmp2);
+
+    let p3_z = emit_gf_add(bld, &f, &g);
+    let p3_t = emit_gf_mul(bld, &p3_x, &p3_z);
+
+    CurvePoint { x: p3_x, s: p3_s, z: p3_z, t: p3_t }
+}
+
 /// Apply the Frobenius endomorphism on a point (i.e. square all coordinates).
 ///
 /// Squares all coordinates of a xsk233 curve point.
@@ -298,6 +334,73 @@ pub(crate) fn template_emit_point_add() -> Template {
     }
 }
 
+// Generate Circuit Configuration for mixed Point Addition
+pub(crate) fn template_emit_point_add_mixed() -> Template {
+    println!("Initializing template_emit_point_add_mixed");
+    let mut bld = CircuitAdapter::default();
+    let const_wire_zero = bld.zero();
+    let const_wire_one = bld.one();
+    let p1 = CurvePoint { x: bld.fresh(), s: bld.fresh(), z: bld.fresh(), t: bld.fresh() };
+    let p2 = CurvePoint { x: bld.fresh(), s: bld.fresh(), z: bld.fresh(), t: bld.fresh() };
+
+    let mut input_wires = vec![];
+    input_wires.extend_from_slice(&p1.x);
+    input_wires.extend_from_slice(&p1.s);
+    input_wires.extend_from_slice(&p1.z);
+    input_wires.extend_from_slice(&p1.t);
+
+    input_wires.extend_from_slice(&p2.x);
+    input_wires.extend_from_slice(&p2.s);
+    input_wires.extend_from_slice(&p2.z);
+    input_wires.extend_from_slice(&p2.t);
+
+    let start_wire_idx = bld.next_wire();
+    let res = emit_point_add_mixed(&mut bld, &p1, &p2);
+    let end_wire_idx = bld.next_wire();
+
+    let mut output_wires = vec![];
+    output_wires.extend_from_slice(&res.x);
+    output_wires.extend_from_slice(&res.s);
+    output_wires.extend_from_slice(&res.z);
+    output_wires.extend_from_slice(&res.t);
+
+    let gates = bld.get_gates();
+
+    let stats = {
+        let mut temp_and_gates_count = 0;
+        let mut temp_xor_gates_count = 0;
+        let mut temp_or_gates_count = 0;
+        for g in gates {
+            if let GateOperation::Base(bg) = g {
+                match bg {
+                    Operation::Add(_, _, _) => {
+                        temp_xor_gates_count += 1;
+                    }
+                    Operation::Mul(_, _, _) => {
+                        temp_and_gates_count += 1;
+                    }
+                    Operation::Or(_, _, _) => {
+                        temp_or_gates_count += 1;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        (temp_and_gates_count, temp_xor_gates_count, temp_or_gates_count)
+    };
+
+    Template {
+        input_wires,
+        output_wires,
+        gates: gates.clone(),
+        start_wire_idx,
+        end_wire_idx,
+        const_wire_one,
+        const_wire_zero,
+        stats,
+    }
+}
+
 #[cfg(all(test, feature = "verify"))]
 mod test {
     use std::{os::raw::c_void, str::FromStr, time::Instant};
@@ -308,6 +411,7 @@ mod test {
         gf_ref::bits_to_gfref,
     };
     use num_bigint::{BigUint, RandomBits};
+    use num_traits::One;
     use rand::Rng;
     use xs233_sys::xsk233_generator;
 
@@ -317,7 +421,7 @@ mod test {
         gf_ref::{gfref_mul, gfref_to_bits},
     };
 
-    use super::{CurvePoint, emit_point_add};
+    use super::{CurvePoint, emit_point_add, emit_point_add_mixed};
 
     // Creates a random point ensuring T = X*Z
     fn random_point() -> InnerPointRef {
@@ -328,6 +432,17 @@ mod test {
         let z = rng.sample(RandomBits::new(max_bit_len));
 
         let t = gfref_mul(&x, &z);
+
+        InnerPointRef { x, s, z, t }
+    }
+
+    fn random_affine_point() -> InnerPointRef {
+        let mut rng = rand::thread_rng();
+        let max_bit_len = 232;
+        let x = rng.sample(RandomBits::new(max_bit_len));
+        let s = rng.sample(RandomBits::new(max_bit_len));
+        let z = BigUint::one();
+        let t = x.clone();
 
         InnerPointRef { x, s, z, t }
     }
@@ -364,6 +479,40 @@ mod test {
         println!("emit_point_add took {} seconds to compile ", el.as_secs());
         let stats = bld.gate_counts();
         println!("{stats}");
+
+        let mut witness = Vec::<bool>::with_capacity(233 * 8);
+        witness.extend(gfref_to_bits(&pt.x));
+        witness.extend(gfref_to_bits(&pt.s));
+        witness.extend(gfref_to_bits(&pt.z));
+        witness.extend(gfref_to_bits(&pt.t));
+
+        witness.extend(gfref_to_bits(&pt2.x));
+        witness.extend(gfref_to_bits(&pt2.s));
+        witness.extend(gfref_to_bits(&pt2.z));
+        witness.extend(gfref_to_bits(&pt2.t));
+
+        let wires = bld.eval_gates(&witness);
+
+        let c_ptadd_x = bits_to_gfref(&c_ptadd.x.map(|w_id| wires[w_id]));
+        let c_ptadd_s = bits_to_gfref(&c_ptadd.s.map(|w_id| wires[w_id]));
+        let c_ptadd_z = bits_to_gfref(&c_ptadd.z.map(|w_id| wires[w_id]));
+        let c_ptadd_t = bits_to_gfref(&c_ptadd.t.map(|w_id| wires[w_id]));
+
+        let c_ptadd_val = InnerPointRef { x: c_ptadd_x, s: c_ptadd_s, z: c_ptadd_z, t: c_ptadd_t };
+        assert_eq!(c_ptadd_val, ptadd);
+    }
+
+    #[test]
+    fn test_point_add_mixed() {
+        let pt = random_point();
+        let pt2 = random_affine_point();
+        let ptadd = ref_point_add(&pt, &pt2);
+
+        let mut bld = CircuitAdapter::default();
+        let c_pt = CurvePoint { x: bld.fresh(), s: bld.fresh(), z: bld.fresh(), t: bld.fresh() };
+        let c_pt2 = CurvePoint { x: bld.fresh(), s: bld.fresh(), z: bld.fresh(), t: bld.fresh() };
+
+        let c_ptadd = emit_point_add_mixed(&mut bld, &c_pt, &c_pt2);
 
         let mut witness = Vec::<bool>::with_capacity(233 * 8);
         witness.extend(gfref_to_bits(&pt.x));
