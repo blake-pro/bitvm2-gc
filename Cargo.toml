@@ -49,11 +49,13 @@ ecdsa-core = { git = "https://github.com/ziren-patches/signatures", package = "e
 rsa = { git = "https://github.com/ziren-patches/RustCrypto-RSA.git", branch = "patch-rsa-0.9.6" }
 secp256k1 = { git = "https://github.com/ziren-patches/rust-secp256k1", branch = "patch-0.29.1" }
 sha2 = { git = "https://github.com/ziren-patches/RustCrypto-hashes", branch = "patch-sha2-0.10.9" }
-# patch-0.6.0 HEAD (0dfeeb1) pins zkm-lib to Ziren v1.2.7; aba7138 is the commit Ziren v2.0 itself locks.
-substrate-bn = { git = "https://github.com/ziren-patches/bn", rev = "aba71380457d798039111e6cc0fdf2e0718c6766" }
+# patch-0.6.0 HEAD (0dfeeb1) pins zkm-lib to Ziren v1.2.7; aba7138 (the commit Ziren v2.0 itself
+# locks) leaves zkm-lib on Ziren's default branch. zkMIPS-patches is the old name of ziren-patches.
+substrate-bn = { git = "https://github.com/zkMIPS-patches/bn", rev = "aba71380457d798039111e6cc0fdf2e0718c6766" }
 k256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-k256-0.13.4" }
 p256 = { git = "https://github.com/ziren-patches/elliptic-curves", branch = "patch-p256-0.13.2" }
 
 # zkm-verifier depends on ziren-patches/bn directly by git, so [patch.crates-io] does not reach it.
+# Cargo rejects a patch that points back to the same URL, hence the zkMIPS-patches alias.
 [patch."https://github.com/ziren-patches/bn.git"]
-substrate-bn = { git = "https://github.com/ziren-patches/bn", rev = "aba71380457d798039111e6cc0fdf2e0718c6766" }
+substrate-bn = { git = "https://github.com/zkMIPS-patches/bn", rev = "aba71380457d798039111e6cc0fdf2e0718c6766" }
