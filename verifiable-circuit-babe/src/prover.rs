@@ -1,21 +1,21 @@
-use ark_bn254::{Bn254, G1Affine, G1Projective, G2Affine};
-use ark_ec::{AffineRepr, CurveGroup};
-use ark_ec::pairing::Pairing;
-use ark_ff::{One, Zero};
-use ark_groth16::Proof as Groth16Proof;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use garbled_snark_verifier::bag::{Circuit, S};
-use ark_groth16::VerifyingKey as Groth16VerifyingKey;
-use garbled_snark_verifier::dv_bn254::fq::Fq as DvFq;
-use garbled_snark_verifier::dv_bn254::fr::Fr as DvFr;
 use crate::babe::{WitnessEncProveCt, WitnessEncSetupCt};
 use crate::cac::{CACSetupPackage, FinalizedInstanceData};
-use crate::dre::matrices::u_bar_vec;
 use crate::dre::N_PADDED;
-use crate::gc::{SparseAdaptorTable, SGC_PART1_CONSTANT_SIZE};
+use crate::dre::matrices::u_bar_vec;
+use crate::gc::{SGC_PART1_CONSTANT_SIZE, SparseAdaptorTable};
 use crate::instance::{b_value_bits, set_gc_const_labels, set_sgc2_rq_eval_labels};
 use crate::soldering::{SolderedLabelsData, SolderingData};
 use crate::utils::{derive_hashlock, h_160, h_256, ro_from_pairing_bytes};
+use ark_bn254::{Bn254, G1Affine, G1Projective, G2Affine};
+use ark_ec::pairing::Pairing;
+use ark_ec::{AffineRepr, CurveGroup};
+use ark_ff::{One, Zero};
+use ark_groth16::Proof as Groth16Proof;
+use ark_groth16::VerifyingKey as Groth16VerifyingKey;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use garbled_snark_verifier::bag::{Circuit, S};
+use garbled_snark_verifier::dv_bn254::fq::Fq as DvFq;
+use garbled_snark_verifier::dv_bn254::fr::Fr as DvFr;
 
 pub const GROTH_16_SEED: u64 = 42;
 
@@ -32,7 +32,7 @@ impl BABEProver {
     pub fn new(
         vk: Groth16VerifyingKey<Bn254>,
         groth16_proof: Groth16Proof<Bn254>,
-        dyn_pubin: ark_bn254::Fr
+        dyn_pubin: ark_bn254::Fr,
     ) -> Self {
         Self {
             groth16_proof,
@@ -141,7 +141,10 @@ impl BABEProver {
             &pi1_labels,
             &x_d_labels,
             h_msgs_onchain[0],
-            &mut fgc, &fgc_indices, &mut sgc, &sgc_indices,
+            &mut fgc,
+            &fgc_indices,
+            &mut sgc,
+            &sgc_indices,
         );
         match base_res {
             Ok(true) => return true,
@@ -187,7 +190,10 @@ impl BABEProver {
                 &instance_pi1_labels,
                 &instance_x_d_labels,
                 h_msgs_onchain[i],
-                &mut fgc, &fgc_indices, &mut sgc, &sgc_indices,
+                &mut fgc,
+                &fgc_indices,
+                &mut sgc,
+                &sgc_indices,
             );
             match temp {
                 Ok(true) => return true,
@@ -213,7 +219,13 @@ impl BABEProver {
         sgc_indices: &[usize],
     ) -> Result<bool, String> {
         let ct_prove = self.compute_ct_prove_for_instance(
-            fgc, fgc_indices, sgc, sgc_indices, data, pi1_labels, x_d_labels,
+            fgc,
+            fgc_indices,
+            sgc,
+            sgc_indices,
+            data,
+            pi1_labels,
+            x_d_labels,
         );
         tracing::info!("compute ct_prove done");
 
@@ -245,7 +257,8 @@ impl BABEProver {
         aes_salt: S,
     ) -> WitnessEncProveCt {
         assert_eq!(
-            const_labels[1].len(), SGC_PART1_CONSTANT_SIZE,
+            const_labels[1].len(),
+            SGC_PART1_CONSTANT_SIZE,
             "const_labels[1] (SGC constant labels) must have length SGC_PART1_CONSTANT_SIZE"
         );
 
@@ -257,8 +270,11 @@ impl BABEProver {
         for (i, &lbl) in pi1_labels.iter().enumerate() {
             fgc.0[i + 2].borrow_mut().label = Some(lbl);
         }
-        let fgc_witness: Vec<bool> = DvFq::to_bits(pi1.x).into_iter().chain([false, false])
-            .chain(DvFq::to_bits(pi1.y)).chain([false, false])
+        let fgc_witness: Vec<bool> = DvFq::to_bits(pi1.x)
+            .into_iter()
+            .chain([false, false])
+            .chain(DvFq::to_bits(pi1.y))
+            .chain([false, false])
             .collect();
         let fgc_output_labels = BABEProver::eval_circuit_with_ciphertext(
             fgc,
@@ -266,11 +282,9 @@ impl BABEProver {
             &fgc_witness,
             &ciphertext_sets[0],
             2,
-            Some(aes_salt)
+            Some(aes_salt),
         );
-        let ct1 = BABEProver::eval_adaptor_table(
-            &fgc_output_labels, pi1, &adaptor_tables[0]
-        );
+        let ct1 = BABEProver::eval_adaptor_table(&fgc_output_labels, pi1, &adaptor_tables[0]);
 
         // --------Compute ct1'--------------
         // Part1: compute Q = x_d * L2 + B.
@@ -286,24 +300,28 @@ impl BABEProver {
         for (i, bit) in b_y_bits.iter().enumerate() {
             sgc.0[2 + 254 + i].borrow_mut().value = Some(*bit);
         }
-        let sgc_part1_witness: Vec<bool> = DvFr::to_bits(x_d).into_iter().chain([false, false]).collect();
+        let sgc_part1_witness: Vec<bool> =
+            DvFr::to_bits(x_d).into_iter().chain([false, false]).collect();
         let sgc_output_labels_1 = BABEProver::eval_circuit_with_ciphertext(
             sgc,
             sgc_indices,
             &sgc_part1_witness,
             &ciphertext_sets[1],
             SGC_PART1_CONSTANT_SIZE,
-            Some(aes_salt)
+            Some(aes_salt),
         );
 
         // Part2: compute rQ
-        let q = self.vk.gamma_abc_g1[2] * self.dyn_pubin + b;
+        let q = self.vk.gamma_abc_g1[crate::utils::DYNAMIC_BASE_IDX] * self.dyn_pubin + b;
         let q_affine = q.into_affine();
         fgc.reset_circuit_except_01_constants();
         set_gc_const_labels(fgc, &const_labels[1][0..2]);
         set_sgc2_rq_eval_labels(fgc, &sgc_output_labels_1, const_labels[1][0]);
-        let sgc_witness: Vec<bool> = DvFq::to_bits(q_affine.x).into_iter().chain([false, false])
-            .chain(DvFq::to_bits(q_affine.y)).chain([false, false])
+        let sgc_witness: Vec<bool> = DvFq::to_bits(q_affine.x)
+            .into_iter()
+            .chain([false, false])
+            .chain(DvFq::to_bits(q_affine.y))
+            .chain([false, false])
             .collect();
         let sgc_output_labels_2 = BABEProver::eval_circuit_with_ciphertext(
             fgc,
@@ -311,11 +329,10 @@ impl BABEProver {
             &sgc_witness,
             &ciphertext_sets[2],
             2,
-            Some(aes_salt)
+            Some(aes_salt),
         );
-        let ct1_prime = BABEProver::eval_adaptor_table(
-            &sgc_output_labels_2, q_affine, &adaptor_tables[1]
-        );
+        let ct1_prime =
+            BABEProver::eval_adaptor_table(&sgc_output_labels_2, q_affine, &adaptor_tables[1]);
 
         WitnessEncProveCt { ct1_r_pi1: ct1, ct1_prime }
     }
@@ -359,10 +376,8 @@ impl BABEProver {
         }
         circuit.garbled_evaluate_without_delta(ciphertext, salt);
 
-        let output_labels: Vec<[u8; 16]> = output_indices
-            .iter()
-            .map(|i| circuit.0[*i].borrow().get_label().0)
-            .collect();
+        let output_labels: Vec<[u8; 16]> =
+            output_indices.iter().map(|i| circuit.0[*i].borrow().get_label().0).collect();
         output_labels
     }
 
@@ -390,7 +405,6 @@ impl BABEProver {
         let mut ct = Vec::new();
         result.serialize_compressed(&mut ct).expect("serialize r·G1P");
         ct
-
     }
 
     /// Decrypt the message from `ct_prove` and `ct_setup` using the Groth16 proof.
@@ -414,7 +428,9 @@ impl BABEProver {
         let mask_gt = r_y - q_blind;
 
         let mut mask_bytes = Vec::new();
-        mask_gt.serialize_compressed(&mut mask_bytes).map_err(|e| format!("serialize mask_gt: {e}"))?;
+        mask_gt
+            .serialize_compressed(&mut mask_bytes)
+            .map_err(|e| format!("serialize mask_gt: {e}"))?;
         let mask = ro_from_pairing_bytes(&mask_bytes, 32);
 
         let ct3 = &ct_setup.ct3_masked_msg;
@@ -432,15 +448,15 @@ impl BABEProver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_bn254::{Bn254, Fr};
-    use ark_crypto_primitives::snark::{CircuitSpecificSetupSNARK, SNARK};
-    use rand::SeedableRng;
-    use garbled_snark_verifier::core::utils::reset_gid;
     use crate::babe::DummyMulCircuit;
     use crate::cac::cac_finalize_indices;
     use crate::instance::CACInstance;
     use crate::soldering::{build_soldered_wires_input, soldering_guest_compute};
     use crate::verifier::BABEVerifier;
+    use ark_bn254::{Bn254, Fr};
+    use ark_crypto_primitives::snark::{CircuitSpecificSetupSNARK, SNARK};
+    use garbled_snark_verifier::core::utils::reset_gid;
+    use rand::SeedableRng;
 
     const TEST_N_CC: usize = 4;
     const TEST_M_CC: usize = 2;
@@ -457,21 +473,20 @@ mod tests {
         let (pk, vk) = ark_groth16::Groth16::<Bn254>::setup(
             DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) },
             &mut rng,
-        ).unwrap();
+        )
+        .unwrap();
         let proof = ark_groth16::Groth16::<Bn254>::prove(
             &pk,
             DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) },
             &mut rng,
-        ).unwrap();
-        let static_public_inputs = a * b;
+        )
+        .unwrap();
+        let static_public_inputs = [a * b];
         let dynamic_public_inputs = a * a; // x_d
 
         // 2. Verifier enc_setup.
-        let verifier = CACInstance::new_from_seed(
-            rand::random(),
-            &vk,
-            static_public_inputs,
-        ).unwrap();
+        let verifier =
+            CACInstance::new_from_seed(rand::random(), &vk, &static_public_inputs).unwrap();
 
         // 3. Input labels: [pi1_xbits, pi1_ybits, x_dbits...].
         let pi1_labels = verifier.compute_pi1_labels_based_on_value(proof.a);
@@ -480,11 +495,7 @@ mod tests {
 
         // 4. Prover evaluates the garbled circuit.
         // Prover has: 2 circuits, input labels, constants labels & value
-        let prover = BABEProver::new(
-            vk.clone(),
-            proof.clone(),
-            dynamic_public_inputs
-        );
+        let prover = BABEProver::new(vk.clone(), proof.clone(), dynamic_public_inputs);
         let (mut fgc, fgc_indices, mut sgc, sgc_indices) = crate::gc::read_flat_original_gc();
 
         let ct_prove = prover.compute_ct_prove(
@@ -510,19 +521,21 @@ mod tests {
 
     /// Build the common C&C + soldering scaffolding used by both tests below.
     /// Returns `(verifier, package, finalized_indices, finalized, soldering, h_msgs_onchain)`.
-    fn setup_cac_soldering(
-    ) -> (BABEVerifier, CACSetupPackage, Vec<usize>, Vec<FinalizedInstanceData>, SolderedLabelsData)
+    fn setup_cac_soldering()
+    -> (BABEVerifier, CACSetupPackage, Vec<usize>, Vec<FinalizedInstanceData>, SolderedLabelsData)
     {
         let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(GROTH_16_SEED);
         let a = Fr::from(3u64);
         let b = Fr::from(7u64);
         let (_, vk) = ark_groth16::Groth16::<Bn254>::setup(
-            DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) }, &mut rng,
-        ).unwrap();
-        let static_public_inputs = a * b;
+            DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) },
+            &mut rng,
+        )
+        .unwrap();
+        let static_public_inputs = [a * b];
         let _dynamic_public_inputs = a * a;
 
-        let verifier = BABEVerifier::new(TEST_N_CC, &vk, static_public_inputs).unwrap();
+        let verifier = BABEVerifier::new(TEST_N_CC, &vk, &static_public_inputs).unwrap();
         let package = verifier.commit();
         let finalized_indices = cac_finalize_indices(TEST_N_CC, TEST_M_CC);
         let (_temp, finalized) = verifier.open(&finalized_indices).expect("verifier open failed");
@@ -572,7 +585,6 @@ mod tests {
         let _static_public_inputs = a * b;
         let dynamic_public_inputs = a * a;
 
-
         // base_input_labels: active labels for the 508 π₁ input wires of the base instance.
         let base_idx = finalized_indices[0];
         let pi1_labels = verifier.compute_pi1_labels(base_idx, proof.a);
@@ -581,9 +593,14 @@ mod tests {
 
         // Extract h_msgs from bitcoin script of WronglyChallenged Txn
         // But in this test, we just get from package
-        let mut h_msgs_onchain: Vec<[u8; 20]> = finalized_indices.iter().map(|&idx| package.commits[idx].h_msg).collect();
+        let mut h_msgs_onchain: Vec<[u8; 20]> =
+            finalized_indices.iter().map(|&idx| package.commits[idx].h_msg).collect();
         let found = prover.check_compute_msg_with_soldered_output(
-            &finalized, &pi1_labels, &x_d_labels, &soldered_output, &h_msgs_onchain,
+            &finalized,
+            &pi1_labels,
+            &x_d_labels,
+            &soldered_output,
+            &h_msgs_onchain,
         );
 
         assert!(found, "expected a valid msg to be found");
@@ -596,7 +613,11 @@ mod tests {
         let mut prover = BABEProver::new(vk, proof, dynamic_public_inputs);
         h_msgs_onchain[0] = [0u8; 20];
         let found = prover.check_compute_msg_with_soldered_output(
-            &finalized, &pi1_labels, &x_d_labels, &soldered_output, &h_msgs_onchain,
+            &finalized,
+            &pi1_labels,
+            &x_d_labels,
+            &soldered_output,
+            &h_msgs_onchain,
         );
         assert!(found, "expected a valid msg to be found");
         assert!(prover.valid_msg.is_some());
@@ -638,7 +659,11 @@ mod tests {
         let h_msgs_onchain: Vec<[u8; 20]> =
             finalized_indices.iter().map(|&idx| package.commits[idx].h_msg).collect();
         let found = prover.check_compute_msg_with_soldered_output(
-            &finalized, &pi1_labels, &x_d_labels, &soldered_output, &h_msgs_onchain,
+            &finalized,
+            &pi1_labels,
+            &x_d_labels,
+            &soldered_output,
+            &h_msgs_onchain,
         );
 
         assert!(!found, "a mismatched x_d must not decrypt the message");

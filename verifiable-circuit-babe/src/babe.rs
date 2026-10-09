@@ -2,25 +2,29 @@ use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{Proof as Groth16Proof, VerifyingKey as Groth16VerifyingKey};
 
-use ark_serialize::CanonicalSerialize;
+use crate::cac::{CACSetupPackage, FinalizedInstanceData};
+use ark_ec::pairing::Pairing;
 use ark_relations::lc;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
-use serde::{Deserialize, Serialize};
-use ark_ec::pairing::Pairing;
+use ark_serialize::CanonicalSerialize;
 use garbled_snark_verifier::bag::S;
-use crate::cac::{
-    CACSetupPackage, FinalizedInstanceData,
-};
+use serde::{Deserialize, Serialize};
 
-use crate::wots::{wots96_verify, Wots96, Wots96PublicKey, Wots96Secret};
-use crate::utils::pi1_xd_to_wots96_msg;
-use bitvm::signatures::Wots;
 use crate::dre::N_PADDED;
 use crate::prover::BABEProver;
 use crate::soldering::SolderingData;
-use crate::transactions::{ChallengeAssertWitnessRaw, TxAssertWitness, TxChallengeAssertOutputLock, TxChallengeAssertWitness, TxDepositLock, TxWronglyChallengedWitness};
-pub use crate::utils::{derive_hashlock, g1_from_ser_checked, g1_project_to_ser, g2_from_ser_checked, g2_project_to_ser, groth16_vk_x, h_256, ro_from_pairing_bytes};
+use crate::transactions::{
+    ChallengeAssertWitnessRaw, TxAssertWitness, TxChallengeAssertOutputLock,
+    TxChallengeAssertWitness, TxDepositLock, TxWronglyChallengedWitness,
+};
+use crate::utils::pi1_xd_to_wots96_msg;
+pub use crate::utils::{
+    derive_hashlock, g1_from_ser_checked, g1_project_to_ser, g2_from_ser_checked,
+    g2_project_to_ser, groth16_vk_x, h_256, ro_from_pairing_bytes,
+};
 use crate::verifier::BABEVerifier;
+use crate::wots::{Wots96, Wots96PublicKey, Wots96Secret, wots96_verify};
+use bitvm::signatures::Wots;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 /// Total number of C&C instances the Verifier creates and commits to.
@@ -135,9 +139,10 @@ pub struct BabeCACE2ERun {
 // Bitcoin transaction integration is complete, to prevent replay of a previous protocol run.
 pub fn babe_verifier_cac_setup(
     vk: &Groth16VerifyingKey<Bn254>,
-    static_public_inputs: Fr,
+    static_public_inputs: &[Fr],
 ) -> (BABEVerifier, CACSetupPackage) {
-    let verifier = BABEVerifier::new(N_CC, vk, static_public_inputs).expect("verifier CAC setup failed");
+    let verifier =
+        BABEVerifier::new(N_CC, vk, static_public_inputs).expect("verifier CAC setup failed");
     tracing::info!("Verifier: committing all instances..");
     let package = verifier.commit();
     (verifier, package)
@@ -186,9 +191,7 @@ pub fn babe_verify_prover_presigs(
             .h_msgs
             .iter()
             .zip(finalized_indices.iter())
-            .all(|(&h_msg, &idx)| {
-                package.commits.get(idx).is_some_and(|c| c.h_msg == h_msg)
-            });
+            .all(|(&h_msg, &idx)| package.commits.get(idx).is_some_and(|c| c.h_msg == h_msg));
 
     presigs_valid && keys_valid && h_msgs_valid
 }
@@ -203,7 +206,11 @@ pub fn babe_build_deposit_lock(pk_p: BtcPk, pk_v: BtcPk, amount: u64) -> TxDepos
 
 /// Prover: sign π₁ and x_d with wots_sk_P and build the assert witness.
 /// π₂ and π₃ are serialized (compressed) into the witness for the Verifier to recover.
-pub fn babe_prover_assert(proof: &Groth16Proof<Bn254>, wots_sk: &Wots96Secret, x_d: ark_bn254::Fr) -> TxAssertWitness {
+pub fn babe_prover_assert(
+    proof: &Groth16Proof<Bn254>,
+    wots_sk: &Wots96Secret,
+    x_d: ark_bn254::Fr,
+) -> TxAssertWitness {
     let pi1 = proof.a;
     let msg = pi1_xd_to_wots96_msg(&pi1, x_d);
     let wots_sig = Wots96::sign(wots_sk, &msg);
@@ -253,9 +260,11 @@ pub fn build_challenge_assert_witness(
     assert_witness: &TxAssertWitness,
     base_idx: usize,
 ) -> TxChallengeAssertWitness {
-    let arr_sig: [[u8; 21]; Wots96::TOTAL_DIGIT_LEN as usize] =
-        assert_witness.wots_sig.clone().try_into()
-            .expect("caller must ensure wots_sig has the correct length");
+    let arr_sig: [[u8; 21]; Wots96::TOTAL_DIGIT_LEN as usize] = assert_witness
+        .wots_sig
+        .clone()
+        .try_into()
+        .expect("caller must ensure wots_sig has the correct length");
     let msg = Wots96::signature_to_message(&arr_sig);
     let labels = verifier.compute_labels_from_bytes(base_idx, &msg);
     let input_labels: Vec<[u8; 16]> = labels.into_iter().map(|s| s.0).collect();
@@ -277,7 +286,8 @@ pub fn babe_prover_wrongly_challenged_cac(
     proof: &Groth16Proof<Bn254>,
     prover_state: &ProverSetupState,
 ) -> Option<(TxWronglyChallengedWitness, usize)> {
-    let base_input_labels: Vec<S> = challenge_witness.witness.input_labels.iter().map(|&b| S(b)).collect();
+    let base_input_labels: Vec<S> =
+        challenge_witness.witness.input_labels.iter().map(|&b| S(b)).collect();
     let pi1_labels = base_input_labels[..2 * N_PADDED].to_vec();
     let x_d_labels = base_input_labels[2 * N_PADDED..].to_vec();
     let mut prover = BABEProver::new(vk.clone(), proof.clone(), dyn_pubin);
@@ -348,12 +358,12 @@ impl<F: PrimeField> ConstraintSynthesizer<F> for DummyMulCircuit<F> {
 
 #[cfg(test)]
 mod tests {
-    use ark_bn254::G1Affine;
     use super::*;
+    use crate::wots::{Wots96, wots96_verify};
+    use ark_bn254::G1Affine;
     use ark_ff::UniformRand;
-    use rand::SeedableRng;
-    use crate::wots::{wots96_verify, Wots96};
     use bitvm::signatures::Wots;
+    use rand::SeedableRng;
 
     #[test]
     fn hashlock_roundtrip() {
@@ -436,7 +446,12 @@ mod tests {
         };
 
         assert!(babe_verify_prover_presigs(
-            &presigs, &outlock, &pk_p, &pk_v, &package, &finalized_indices,
+            &presigs,
+            &outlock,
+            &pk_p,
+            &pk_v,
+            &package,
+            &finalized_indices,
         ));
 
         // Wrong presig kind must fail.
@@ -445,12 +460,22 @@ mod tests {
             sig_no_withdraw: BabeBtcSig::ProverPresigNoWithdraw,
         };
         assert!(!babe_verify_prover_presigs(
-            &bad_presigs, &outlock, &pk_p, &pk_v, &package, &finalized_indices,
+            &bad_presigs,
+            &outlock,
+            &pk_p,
+            &pk_v,
+            &package,
+            &finalized_indices,
         ));
 
         // Pubkey mismatch must fail.
         assert!(!babe_verify_prover_presigs(
-            &presigs, &outlock, &dummy_pk(9), &pk_v, &package, &finalized_indices,
+            &presigs,
+            &outlock,
+            &dummy_pk(9),
+            &pk_v,
+            &package,
+            &finalized_indices,
         ));
 
         // Tampered h_msg (doesn't match package commit) must fail.
@@ -460,7 +485,12 @@ mod tests {
             h_msgs: vec![h_msg0, [0xCCu8; 20]],
         };
         assert!(!babe_verify_prover_presigs(
-            &presigs, &bad_outlock, &pk_p, &pk_v, &package, &finalized_indices,
+            &presigs,
+            &bad_outlock,
+            &pk_p,
+            &pk_v,
+            &package,
+            &finalized_indices,
         ));
 
         // Wrong h_msgs length must fail.
@@ -470,7 +500,12 @@ mod tests {
             h_msgs: vec![h_msg0],
         };
         assert!(!babe_verify_prover_presigs(
-            &presigs, &short_outlock, &pk_p, &pk_v, &package, &finalized_indices,
+            &presigs,
+            &short_outlock,
+            &pk_p,
+            &pk_v,
+            &package,
+            &finalized_indices,
         ));
     }
 

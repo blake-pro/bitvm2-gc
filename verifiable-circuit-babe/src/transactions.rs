@@ -1,14 +1,14 @@
 // ─── Transaction skeletons. This will be replaced by real Txn in Bitvm2-node ─────────
 
+use crate::babe::{BTC_SIG_BYTES, BabeBtcSig, BtcPk, MSG_BYTES};
+use crate::utils::{assemble_public_inputs, g1_from_ser_checked, g2_from_ser_checked};
+use crate::wots::Wots96;
 use ark_bn254::{Bn254, Fq, Fr, G1Affine, G2Affine};
 use ark_ec::CurveGroup;
 use ark_groth16::{Proof as Groth16Proof, VerifyingKey as Groth16VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
-use serde::{Deserialize, Serialize};
-use crate::babe::{BabeBtcSig, BtcPk, BTC_SIG_BYTES, MSG_BYTES};
-use crate::utils::{g1_from_ser_checked, g2_from_ser_checked};
-use crate::wots::Wots96;
 use bitvm::signatures::Wots;
+use serde::{Deserialize, Serialize};
 
 /// Constants embedded in the locking script of tx_Deposit output 0.
 /// Script: CheckSig(pk_P) ∧ CheckSig(pk_V)
@@ -72,7 +72,9 @@ impl TxAssertWitness {
 
     /// Reconstruct the full Groth16 proof (π₁, π₂, π₃) and verify it.
     /// π₁ and x_d are recovered from `wots_sig`; π₂ and π₃ from `pi2`/`pi3`.
-    /// `static_public_inputs` are prepended to `[x_d]` to form the complete public input vector.
+    /// `static_public_inputs` lists every public input except `x_d` in circuit order; `x_d` is
+    /// inserted at `DYNAMIC_INPUT_IDX` to form the complete public input vector (for Ziren v2.0:
+    /// `[vkey_hash, x_d, vk_root]`).
     /// Returns false if any field is malformed or the proof does not verify.
     pub fn verify_groth16_proof(
         &self,
@@ -87,8 +89,7 @@ impl TxAssertWitness {
             Some(v) => v,
             None => return false,
         };
-        let mut public_inputs = static_public_inputs.to_vec();
-        public_inputs.push(x_d);
+        let public_inputs = assemble_public_inputs(static_public_inputs, x_d);
         verify_groth16_proof_components(pi1, pi2, pi3, &public_inputs, vk)
     }
 }
@@ -180,7 +181,7 @@ impl OnchainSize for TxAssertWitness {
     fn size_bytes(&self) -> usize {
         Wots96::TOTAL_DIGIT_LEN as usize * 21
             + 64  // π₂: G2Affine compressed
-            + 32  // π₃: G1Affine compressed
+            + 32 // π₃: G1Affine compressed
     }
 }
 
@@ -189,14 +190,14 @@ impl OnchainSize for TxChallengeAssertWitness {
         self.witness.input_labels.len() * 16                 // LAMPORT_N × 16 bytes
             + Wots96::TOTAL_DIGIT_LEN as usize * 20  // wots_sig preimages
             + BTC_SIG_BYTES                          // sig_v: 32 bytes
-            + BTC_SIG_BYTES                          // sig_p: 32 bytes
+            + BTC_SIG_BYTES // sig_p: 32 bytes
     }
 }
 
 impl OnchainSize for TxWronglyChallengedWitness {
     fn size_bytes(&self) -> usize {
         BTC_SIG_BYTES // sig_p: 32 bytes
-            + MSG_BYTES   // msg:   32 bytes
+            + MSG_BYTES // msg:   32 bytes
     }
 }
 
@@ -215,14 +216,14 @@ impl OnchainSize for TxWithdrawWitness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::babe::DummyMulCircuit;
+    use crate::utils::pi1_xd_to_wots96_msg;
+    use crate::wots::Wots96;
     use ark_bn254::{Fq, Fr, G1Affine};
     use ark_ec::{AffineRepr, CurveGroup};
     use ark_ff::UniformRand;
     use ark_serialize::CanonicalSerialize;
     use bitvm::signatures::Wots;
-    use crate::babe::DummyMulCircuit;
-    use crate::utils::pi1_xd_to_wots96_msg;
-    use crate::wots::Wots96;
 
     fn make_witness_from_raw_msg(msg: &[u8; 96]) -> TxAssertWitness {
         let sk = Wots96::generate_secret_key();
@@ -247,13 +248,15 @@ mod tests {
     fn test_recover_wrong_length() {
         let witness = TxAssertWitness {
             wots_sig: vec![[0u8; 21]; Wots96::TOTAL_DIGIT_LEN as usize - 1],
-            pi2: vec![], pi3: vec![],
+            pi2: vec![],
+            pi3: vec![],
         };
         assert!(witness.try_recover_pi1_xd().is_none());
 
         let witness = TxAssertWitness {
             wots_sig: vec![[0u8; 21]; Wots96::TOTAL_DIGIT_LEN as usize + 1],
-            pi2: vec![], pi3: vec![],
+            pi2: vec![],
+            pi3: vec![],
         };
         assert!(witness.try_recover_pi1_xd().is_none());
     }

@@ -1,8 +1,8 @@
 use ark_bn254::{Fq, Fr, G1Affine, G2Affine};
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_groth16::VerifyingKey as Groth16VerifyingKey;
-use ripemd::{Ripemd160, Digest as RipemdDigest};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ripemd::{Digest as RipemdDigest, Ripemd160};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
@@ -18,6 +18,43 @@ pub fn groth16_vk_x(
         acc += vk.gamma_abc_g1[i + 1].into_group() * *x;
     }
     Some(acc)
+}
+
+/// Position of the dynamic public input `x_d` in the full Groth16 public-input vector.
+///
+/// Ziren's wrap circuit exposes `[vkey_hash, committed_values_digest, vk_root]`, so `x_d` sits at
+/// index 1 with `vkey_hash` before it and `vk_root` after it. The same holds for the 2-input
+/// `DummyMulCircuit` used in tests (`[static, dynamic]`).
+pub const DYNAMIC_INPUT_IDX: usize = 1;
+
+/// Index into `gamma_abc_g1` of the base point `L_D` of the dynamic input (`gamma_abc_g1[0]` is the
+/// constant term).
+pub const DYNAMIC_BASE_IDX: usize = DYNAMIC_INPUT_IDX + 1;
+
+/// `P_S = L_0 + Σ x_S[i]·L_{pos(i)}`: the static part of `vk_x`.
+///
+/// `static_inputs` lists every public input except the dynamic one, in circuit order. Returns
+/// `None` unless the vk has exactly one base point per static input plus `L_0` and `L_D`.
+pub fn static_vk_x(
+    vk: &Groth16VerifyingKey<ark_bn254::Bn254>,
+    static_inputs: &[Fr],
+) -> Option<ark_bn254::G1Projective> {
+    if static_inputs.len() < DYNAMIC_INPUT_IDX || vk.gamma_abc_g1.len() != static_inputs.len() + 2 {
+        return None;
+    }
+    let mut acc = vk.gamma_abc_g1[0].into_group();
+    for (i, x) in static_inputs.iter().enumerate() {
+        // Position of this static input once the dynamic one is slotted in.
+        let pos = if i < DYNAMIC_INPUT_IDX { i } else { i + 1 };
+        acc += vk.gamma_abc_g1[pos + 1].into_group() * *x;
+    }
+    Some(acc)
+}
+
+/// Full ordered public-input vector: `x_d` is inserted at [`DYNAMIC_INPUT_IDX`] among the statics.
+pub fn assemble_public_inputs(static_inputs: &[Fr], x_d: Fr) -> Vec<Fr> {
+    let (before, after) = static_inputs.split_at(DYNAMIC_INPUT_IDX.min(static_inputs.len()));
+    before.iter().copied().chain(std::iter::once(x_d)).chain(after.iter().copied()).collect()
 }
 
 pub fn g2_project_to_ser(p: ark_bn254::G2Projective) -> Vec<u8> {
@@ -139,7 +176,9 @@ pub fn serialize_g1affine<S: Serializer>(val: &G1Affine, serializer: S) -> Resul
     bytes.serialize(serializer)
 }
 
-pub fn deserialize_g1affine<'de, D: Deserializer<'de>>(deserializer: D) -> Result<G1Affine, D::Error> {
+pub fn deserialize_g1affine<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<G1Affine, D::Error> {
     let bytes = Vec::<u8>::deserialize(deserializer)?;
     G1Affine::deserialize_compressed(bytes.as_slice()).map_err(serde::de::Error::custom)
 }
@@ -164,13 +203,74 @@ mod tests {
 
         let x1 = Fr::from(3u64);
         let x2 = Fr::from(5u64);
-        let expected = (g0.into_group() + g1.into_group() * x1 + g2.into_group() * x2).into_affine();
+        let expected =
+            (g0.into_group() + g1.into_group() * x1 + g2.into_group() * x2).into_affine();
         let actual = groth16_vk_x(&vk, &[x1, x2]).unwrap().into_affine();
         assert_eq!(actual, expected);
 
         // length mismatch: public_inputs.len() + 1 != gamma_abc_g1.len()
         assert!(groth16_vk_x(&vk, &[x1]).is_none());
         assert!(groth16_vk_x(&vk, &[x1, x2, Fr::from(7u64)]).is_none());
+    }
+
+    /// Ziren v2.0 layout: `[vkey_hash, committed_values_digest, vk_root]`, i.e. a 4-point vk with
+    /// the dynamic input in the middle.
+    #[test]
+    fn test_static_vk_x_with_three_public_inputs() {
+        let mut rng = ChaCha12Rng::seed_from_u64(3);
+        let l: Vec<G1Affine> =
+            (0..4).map(|_| ark_bn254::G1Projective::rand(&mut rng).into_affine()).collect();
+        let vk = Groth16VerifyingKey::<ark_bn254::Bn254> {
+            gamma_abc_g1: l.clone(),
+            ..Default::default()
+        };
+
+        let vkey_hash = Fr::from(11u64);
+        let vk_root = Fr::from(13u64);
+        let x_d = Fr::from(17u64);
+        let statics = [vkey_hash, vk_root];
+
+        // P_S skips L_2, which belongs to the dynamic input.
+        let expected_ps =
+            l[0].into_group() + l[1].into_group() * vkey_hash + l[3].into_group() * vk_root;
+        let p_s = static_vk_x(&vk, &statics).unwrap();
+        assert_eq!(p_s.into_affine(), expected_ps.into_affine());
+
+        // P_S + x_d·L_D equals the generic vk_x over the full, correctly ordered input vector.
+        let full = assemble_public_inputs(&statics, x_d);
+        assert_eq!(full, vec![vkey_hash, x_d, vk_root]);
+        let vk_x = groth16_vk_x(&vk, &full).unwrap();
+        assert_eq!(
+            (p_s + vk.gamma_abc_g1[DYNAMIC_BASE_IDX] * x_d).into_affine(),
+            vk_x.into_affine()
+        );
+
+        // A vk with the old 3-point layout does not match two static inputs, and vice versa.
+        let old_vk = Groth16VerifyingKey::<ark_bn254::Bn254> {
+            gamma_abc_g1: l[..3].to_vec(),
+            ..Default::default()
+        };
+        assert!(static_vk_x(&old_vk, &statics).is_none());
+        assert!(static_vk_x(&vk, &statics[..1]).is_none());
+        assert!(static_vk_x(&vk, &[]).is_none());
+    }
+
+    /// The 2-input layout used by `DummyMulCircuit` (`[static, dynamic]`) keeps working.
+    #[test]
+    fn test_static_vk_x_with_two_public_inputs() {
+        let mut rng = ChaCha12Rng::seed_from_u64(4);
+        let l: Vec<G1Affine> =
+            (0..3).map(|_| ark_bn254::G1Projective::rand(&mut rng).into_affine()).collect();
+        let vk = Groth16VerifyingKey::<ark_bn254::Bn254> {
+            gamma_abc_g1: l.clone(),
+            ..Default::default()
+        };
+
+        let x_s = Fr::from(5u64);
+        let x_d = Fr::from(7u64);
+        let p_s = static_vk_x(&vk, &[x_s]).unwrap();
+        assert_eq!(p_s.into_affine(), (l[0].into_group() + l[1].into_group() * x_s).into_affine());
+        assert_eq!(assemble_public_inputs(&[x_s], x_d), vec![x_s, x_d]);
     }
 
     #[test]
@@ -249,7 +349,10 @@ mod tests {
         );
         #[derive(Serialize, Deserialize)]
         struct G1Wrap(
-            #[serde(serialize_with = "serialize_g1affine", deserialize_with = "deserialize_g1affine")]
+            #[serde(
+                serialize_with = "serialize_g1affine",
+                deserialize_with = "deserialize_g1affine"
+            )]
             G1Affine,
         );
 

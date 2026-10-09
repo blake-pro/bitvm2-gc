@@ -1,17 +1,19 @@
-use ark_bn254::{Fr, G1Affine};
-use ark_groth16::VerifyingKey as Groth16VerifyingKey;
-use ark_serialize::CanonicalSerialize;
-use serde::{Deserialize, Serialize};
 use crate::babe::WitnessEncSetupCt;
-use crate::instance::commit::CACInstanceCommit;
-use crate::gc::{gc_ciphertexts_commit, non_free_gates_counts, SparseAdaptorTable, SGC_PART1_CONSTANT_SIZE};
-use garbled_snark_verifier::bag::S;
-use rand::Rng;
-use garbled_snark_verifier::dv_bn254::fq::Fq;
+use crate::gc::{
+    SGC_PART1_CONSTANT_SIZE, SparseAdaptorTable, gc_ciphertexts_commit, non_free_gates_counts,
+};
 use crate::instance::CACInstance;
+use crate::instance::commit::CACInstanceCommit;
 use crate::instance::secret::Seed;
 use crate::utils::{deserialize_g1affine, g1affine_is_valid, h_256, serialize_g1affine};
 use crate::verifier::BATCH_SIZE;
+use ark_bn254::{Fr, G1Affine};
+use ark_groth16::VerifyingKey as Groth16VerifyingKey;
+use ark_serialize::CanonicalSerialize;
+use garbled_snark_verifier::bag::S;
+use garbled_snark_verifier::dv_bn254::fq::Fq;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 /// What the Verifier sends to the Prover during the C&C commit phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +55,6 @@ pub struct FinalizedInstanceData {
     /// Unused by other hash backends.
     pub aes_salt: S,
 }
-
 
 /// C&C binding check: `opened`, `finalized`, and `soldering_finalized_indices` (all as sent
 /// by the Verifier) must exactly match the partition implied by the Prover's own
@@ -104,10 +105,10 @@ pub fn verify_opened_instances(
     package: &CACSetupPackage,
     opened: &[(usize, Seed)],
     vk: &Groth16VerifyingKey<ark_bn254::Bn254>,
-    static_public_inputs: Fr,
+    static_public_inputs: &[Fr],
 ) -> Result<(), String> {
     use p3_maybe_rayon::prelude::*;
-    
+
     let n_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let batch_size = std::env::var("CAC_BATCH_SIZE")
         .ok()
@@ -128,8 +129,7 @@ pub fn verify_opened_instances(
             batch
                 .par_iter()
                 .map(|&(idx, seed)| {
-                    let recomputed =
-                        CACInstance::commit_from_seed(seed, vk, static_public_inputs)?;
+                    let recomputed = CACInstance::commit_from_seed(seed, vk, static_public_inputs)?;
                     let committed = package.commits.get(idx).ok_or_else(|| {
                         format!(
                             "instance {idx}: index out of range (package has {} commits)",
@@ -191,7 +191,8 @@ pub fn verify_finalized_instances(
         })?;
 
         if data.constant_labels_1.len() != SGC_PART1_CONSTANT_SIZE
-            || committed.constant_commits_sgc.len() != SGC_PART1_CONSTANT_SIZE {
+            || committed.constant_commits_sgc.len() != SGC_PART1_CONSTANT_SIZE
+        {
             return Err(format!(
                 "instance {idx}: constant_labels_1/constant_commits_1 must have length {SGC_PART1_CONSTANT_SIZE}"
             ));
@@ -204,22 +205,25 @@ pub fn verify_finalized_instances(
         }
 
         if data.adaptor_tables[0].commit() != committed.com_adaptor[0]
-            || data.adaptor_tables[1].commit() != committed.com_adaptor[1] {
+            || data.adaptor_tables[1].commit() != committed.com_adaptor[1]
+        {
             return Err(format!("instance {idx}: adaptor_table does not match com_adaptor"));
         }
 
         // verify constant labels
-        if h_256(&data.constant_labels_0[0].0) != committed.constant_commits_fgc[0][0] ||
-            h_256(&data.constant_labels_0[1].0) != committed.constant_commits_fgc[1][1] ||
-            h_256(&data.constant_labels_1[0].0) != committed.constant_commits_sgc[0][0] ||
-            h_256(&data.constant_labels_1[1].0) != committed.constant_commits_sgc[1][1] {
+        if h_256(&data.constant_labels_0[0].0) != committed.constant_commits_fgc[0][0]
+            || h_256(&data.constant_labels_0[1].0) != committed.constant_commits_fgc[1][1]
+            || h_256(&data.constant_labels_1[0].0) != committed.constant_commits_sgc[0][0]
+            || h_256(&data.constant_labels_1[1].0) != committed.constant_commits_sgc[1][1]
+        {
             return Err(format!("instance {idx}: constant_commits do not match"));
         }
         if !g1affine_is_valid(&data.b) {
             return Err(format!("instance {idx}: b is not a valid curve point"));
         }
         let mut b_bytes = Vec::new();
-        data.b.serialize_compressed(&mut b_bytes)
+        data.b
+            .serialize_compressed(&mut b_bytes)
             .map_err(|e| format!("instance {idx}: failed to serialize b: {e}"))?;
         if h_256(&b_bytes) != committed.b_blind_commit {
             return Err(format!("instance {idx}: b does not match b_blind_commit"));
@@ -228,12 +232,16 @@ pub fn verify_finalized_instances(
         let x_bits = Fq::to_bits(Fq::as_montgomery(data.b.x));
         let y_bits = Fq::to_bits(Fq::as_montgomery(data.b.y));
         for (i, bit) in x_bits.iter().enumerate() {
-            if h_256(&data.constant_labels_1[i + 2].0) != committed.constant_commits_sgc[i + 2][*bit as usize] {
+            if h_256(&data.constant_labels_1[i + 2].0)
+                != committed.constant_commits_sgc[i + 2][*bit as usize]
+            {
                 return Err(format!("instance {idx}: constant_commits do not match"));
             }
         }
         for (i, bit) in y_bits.iter().enumerate() {
-            if h_256(&data.constant_labels_1[i + 2 + 254].0) != committed.constant_commits_sgc[i + 2 + 254][*bit as usize] {
+            if h_256(&data.constant_labels_1[i + 2 + 254].0)
+                != committed.constant_commits_sgc[i + 2 + 254][*bit as usize]
+            {
                 return Err(format!("instance {idx}: constant_commits do not match"));
             }
         }
@@ -251,13 +259,13 @@ pub fn verify_finalized_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_chacha::ChaCha12Rng;
-    use ark_bn254::Fr;
-    use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
-    use rand::SeedableRng;
     use crate::babe::DummyMulCircuit;
     use crate::prover::GROTH_16_SEED;
     use crate::verifier::BABEVerifier;
+    use ark_bn254::Fr;
+    use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha12Rng;
 
     const TEST_N_CC: usize = 5;
     const TEST_M_CC: usize = 2;
@@ -269,14 +277,16 @@ mod tests {
         let a = Fr::from(3u64);
         let b = Fr::from(7u64);
         let (_, vk) = ark_groth16::Groth16::<ark_bn254::Bn254>::setup(
-            DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) }, &mut rng,
-        ).expect("groth16 setup");
-        let static_public_inputs = a * b;
+            DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) },
+            &mut rng,
+        )
+        .expect("groth16 setup");
+        let static_public_inputs = [a * b];
         let _dynamic_public_inputs = a * a;
 
         // Verifier creates TEST_N_CC instances and commits.
         let now = std::time::Instant::now();
-        let verifier = BABEVerifier::new(TEST_N_CC, &vk, static_public_inputs)
+        let verifier = BABEVerifier::new(TEST_N_CC, &vk, &static_public_inputs)
             .expect("BABEVerifier::new failed");
         let elapsed = now.elapsed();
         println!("Verifier setup for {TEST_N_CC} instances took {elapsed:.2?}");
@@ -295,11 +305,13 @@ mod tests {
         assert_eq!(opened.len(), TEST_N_CC - TEST_M_CC);
         assert_eq!(finalized.len(), TEST_M_CC);
         let elapsed = now.elapsed();
-        println!("Verifier open for {TEST_N_CC} instances (finalizing {TEST_M_CC}) took {elapsed:.2?}");
+        println!(
+            "Verifier open for {TEST_N_CC} instances (finalizing {TEST_M_CC}) took {elapsed:.2?}"
+        );
 
         let now = std::time::Instant::now();
         // Prover verifies opened instances by re-deriving from seed.
-        verify_opened_instances(&package, &opened, &vk, static_public_inputs)
+        verify_opened_instances(&package, &opened, &vk, &static_public_inputs)
             .expect("opened instance verification failed");
         let elapsed = now.elapsed();
         println!("Prover verification of opened instances took {elapsed:.2?}");
@@ -359,10 +371,15 @@ mod tests {
         let package = dummy_package(PARTITION_N_CC);
         let finalized_indices = vec![1usize, 3];
         let finalized: Vec<_> = finalized_indices.iter().map(|&i| dummy_finalized(i)).collect();
-        let opened: Vec<(usize, Seed)> = vec![0, 2, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
+        let opened: Vec<(usize, Seed)> =
+            vec![0, 2, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
 
         verify_finalized_indices_in_bundle(
-            &package, &opened, &finalized, &finalized_indices, &finalized_indices,
+            &package,
+            &opened,
+            &finalized,
+            &finalized_indices,
+            &finalized_indices,
         )
         .expect("well-formed partition should pass");
     }
@@ -373,10 +390,15 @@ mod tests {
         let finalized_indices = vec![1usize, 3];
         // Verifier sends the finalized data in a different order than the Prover chose.
         let finalized: Vec<_> = vec![3usize, 1].into_iter().map(dummy_finalized).collect();
-        let opened: Vec<(usize, Seed)> = vec![0, 2, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
+        let opened: Vec<(usize, Seed)> =
+            vec![0, 2, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
 
         let err = verify_finalized_indices_in_bundle(
-            &package, &opened, &finalized, &finalized_indices, &finalized_indices,
+            &package,
+            &opened,
+            &finalized,
+            &finalized_indices,
+            &finalized_indices,
         )
         .unwrap_err();
         assert!(err.contains("finalized instances do not match"), "{err}");
@@ -387,11 +409,16 @@ mod tests {
         let package = dummy_package(PARTITION_N_CC);
         let finalized_indices = vec![1usize, 3];
         let finalized: Vec<_> = finalized_indices.iter().map(|&i| dummy_finalized(i)).collect();
-        let opened: Vec<(usize, Seed)> = vec![0, 2, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
+        let opened: Vec<(usize, Seed)> =
+            vec![0, 2, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
         let soldering_finalized_indices = vec![1usize, 4]; // disagrees with finalized_indices
 
         let err = verify_finalized_indices_in_bundle(
-            &package, &opened, &finalized, &finalized_indices, &soldering_finalized_indices,
+            &package,
+            &opened,
+            &finalized,
+            &finalized_indices,
+            &soldering_finalized_indices,
         )
         .unwrap_err();
         assert!(err.contains("soldering finalized_indices do not match"), "{err}");
@@ -406,7 +433,11 @@ mod tests {
         let opened: Vec<(usize, Seed)> = vec![0, 2].into_iter().map(|i| (i, [0u8; 32])).collect();
 
         let err = verify_finalized_indices_in_bundle(
-            &package, &opened, &finalized, &finalized_indices, &finalized_indices,
+            &package,
+            &opened,
+            &finalized,
+            &finalized_indices,
+            &finalized_indices,
         )
         .unwrap_err();
         assert!(err.contains("does not cover all"), "{err}");
@@ -418,10 +449,15 @@ mod tests {
         let finalized_indices = vec![1usize, 3];
         let finalized: Vec<_> = finalized_indices.iter().map(|&i| dummy_finalized(i)).collect();
         // Index 1 is claimed as both opened and finalized.
-        let opened: Vec<(usize, Seed)> = vec![0, 1, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
+        let opened: Vec<(usize, Seed)> =
+            vec![0, 1, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
 
         let err = verify_finalized_indices_in_bundle(
-            &package, &opened, &finalized, &finalized_indices, &finalized_indices,
+            &package,
+            &opened,
+            &finalized,
+            &finalized_indices,
+            &finalized_indices,
         )
         .unwrap_err();
         assert!(err.contains("opened but also claimed as finalized"), "{err}");
@@ -433,10 +469,15 @@ mod tests {
         let finalized_indices = vec![1usize, 3];
         let finalized: Vec<_> = finalized_indices.iter().map(|&i| dummy_finalized(i)).collect();
         // Index 0 is duplicated; still "covers" the right count so the length check passes.
-        let opened: Vec<(usize, Seed)> = vec![0, 0, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
+        let opened: Vec<(usize, Seed)> =
+            vec![0, 0, 4].into_iter().map(|i| (i, [0u8; 32])).collect();
 
         let err = verify_finalized_indices_in_bundle(
-            &package, &opened, &finalized, &finalized_indices, &finalized_indices,
+            &package,
+            &opened,
+            &finalized,
+            &finalized_indices,
+            &finalized_indices,
         )
         .unwrap_err();
         assert!(err.contains("duplicate index in opened"), "{err}");

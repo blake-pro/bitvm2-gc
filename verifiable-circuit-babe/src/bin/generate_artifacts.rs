@@ -20,19 +20,23 @@
 ///   cargo run --release --bin generate_artifacts
 use ark_bn254::G1Affine;
 use verifiable_circuit_babe::gc::generate_compact_artifacts;
+use verifiable_circuit_babe::utils::DYNAMIC_BASE_IDX;
 use zkm_verifier::{IMM_GROTH16_VK_BYTES, load_ark_groth16_verifying_key_from_bytes};
 
 /// Load the dynamic-input coefficient from Ziren's bundled immutable Groth16 VK.
+///
+/// Ziren v2.0 exposes three public inputs `[vkey_hash, committed_values_digest, vk_root]`, so the
+/// VK has `L_0..L_3`. The dynamic input (`committed_values_digest`) is the middle one, `L_2`.
 fn load_immutable_l2_point() -> G1Affine {
     let vk = load_ark_groth16_verifying_key_from_bytes(*IMM_GROTH16_VK_BYTES)
         .expect("failed to parse Ziren immutable Groth16 VK");
     assert_eq!(
         vk.gamma_abc_g1.len(),
-        3,
-        "Ziren immutable Groth16 VK must contain coefficients for two public inputs",
+        4,
+        "Ziren immutable Groth16 VK must contain coefficients for three public inputs",
     );
 
-    vk.gamma_abc_g1[2]
+    vk.gamma_abc_g1[DYNAMIC_BASE_IDX]
 }
 
 fn main() {

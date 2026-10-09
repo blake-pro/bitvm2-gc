@@ -3,11 +3,18 @@ use ark_crypto_primitives::snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_groth16::VerifyingKey as Groth16VerifyingKey;
 use bitvm::signatures::Wots;
 use rand::SeedableRng;
-use verifiable_circuit_babe::babe::{babe_build_deposit_lock, babe_prover_assert, babe_prover_presign, babe_prover_wrongly_challenged_cac, babe_verifier_cac_setup, babe_verifier_challenge_assert_cac, babe_verifier_presign, babe_verify_prover_presigs, babe_verify_verifier_presigs, build_ca_outlock, BtcPk, DummyMulCircuit, ProverSetupState, VerifierSetupState, M_CC, N_CC};
+use verifiable_circuit_babe::babe::{
+    babe_build_deposit_lock, babe_prover_assert, babe_prover_presign,
+    babe_prover_wrongly_challenged_cac, babe_verifier_cac_setup,
+    babe_verifier_challenge_assert_cac, babe_verifier_presign, babe_verify_prover_presigs,
+    babe_verify_verifier_presigs, build_ca_outlock, BtcPk, DummyMulCircuit, ProverSetupState,
+    VerifierSetupState, M_CC, N_CC,
+};
 use verifiable_circuit_babe::cac::{
     cac_finalize_indices, verify_finalized_indices_in_bundle, verify_finalized_instances,
     verify_opened_instances, CACSetupPackage, FinalizedInstanceData,
 };
+use verifiable_circuit_babe::instance::secret::Seed;
 use verifiable_circuit_babe::prover::{BABEProver, GROTH_16_SEED};
 use verifiable_circuit_babe::soldering::{
     build_soldered_wires_input, SolderingData, SolderingProof,
@@ -16,11 +23,10 @@ use verifiable_circuit_babe::transactions::{
     OnchainSize, TxAssertWitness, TxChallengeAssertWitness, TxDepositLock,
     TxWronglyChallengedWitness,
 };
-use verifiable_circuit_babe::instance::secret::Seed;
 use verifiable_circuit_babe::utils::derive_hashlock;
 use verifiable_circuit_babe::verifier::BABEVerifier;
-use zkm_sdk::{include_elf, ProverClient, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 use verifiable_circuit_babe::wots::Wots96;
+use zkm_sdk::{include_elf, ProverClient, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 
 const SOLDERING_GUEST: &[u8] = include_elf!("soldering-guest");
 
@@ -55,8 +61,7 @@ impl BabeBundleBuilder {
         verifier: &BABEVerifier,
         finalized_indices: &[usize],
     ) -> Result<BabeBundle, String> {
-        let (opened, finalized) = verifier.open(finalized_indices)
-            .expect("verifier open failed");
+        let (opened, finalized) = verifier.open(finalized_indices).expect("verifier open failed");
         let soldered_input = build_soldered_wires_input(verifier, finalized_indices);
         let mut stdin = ZKMStdin::new();
         stdin.write(&soldered_input);
@@ -82,7 +87,7 @@ impl BabeBundleBuilder {
         package: &CACSetupPackage,
         bundle: &BabeBundle,
         vk: &Groth16VerifyingKey<Bn254>,
-        static_public_inputs: Fr,
+        static_public_inputs: &[Fr],
         finalized_indices: &[usize],
     ) -> Result<(), String> {
         verify_finalized_indices_in_bundle(
@@ -118,7 +123,7 @@ impl BabeBundleBuilder {
             &mut rng,
         )
         .map_err(|e| format!("failed to prove Groth16 fixture: {e:?}"))?;
-        let static_public_inputs = a * b;
+        let static_public_inputs = [a * b];
         let dynamic_public_inputs = a * a;
 
         // ── Setup phase ───────────────────────────────────────────────────────────
@@ -131,7 +136,7 @@ impl BabeBundleBuilder {
         println!("Verifier generating BTC keys");
         let pk_v = BtcPk([1u8; 33]);
         println!("Verifier: building {} instances...", N_CC);
-        let (verifier, package) = babe_verifier_cac_setup(&vk, static_public_inputs);
+        let (verifier, package) = babe_verifier_cac_setup(&vk, &static_public_inputs);
         // Verifier sends vk and package to Prover
         println!("Verifier: sending pk_v and {} instance commitment to Prover", N_CC);
 
@@ -146,7 +151,13 @@ impl BabeBundleBuilder {
 
         println!("Prover: verifying opening and soldering proof...");
         // Prover verifies everything.
-        self.babe_prover_verify_setup(&package, &bundle, &vk, static_public_inputs, &finalized_indices)?;
+        self.babe_prover_verify_setup(
+            &package,
+            &bundle,
+            &vk,
+            &static_public_inputs,
+            &finalized_indices,
+        )?;
 
         println!("Prover: generating Wots96 signing key...");
         let wots_sk_p = Wots96::generate_secret_key();
@@ -202,7 +213,8 @@ impl BabeBundleBuilder {
         // ── Proving phase ─────────────────────────────────────────────────────────
 
         // Assert: Prover posts π₁ + x_d and Wots96 sig on-chain.
-        let assert_witness = babe_prover_assert(&proof, &prover_state.wots_sk_p, dynamic_public_inputs);
+        let assert_witness =
+            babe_prover_assert(&proof, &prover_state.wots_sk_p, dynamic_public_inputs);
         println!("Prover: posting tx_Assert...");
         println!("tx_Assert witness:            {} bytes", assert_witness.size_bytes());
 
@@ -215,7 +227,8 @@ impl BabeBundleBuilder {
             .map_err(|_| "tx_Assert: wrong Wots96 signature length".to_string())?;
         // 2. Verify Wots96 sig against the operator public key.
         let msg = Wots96::signature_to_message(&arr_sig);
-        if !verifiable_circuit_babe::wots::wots96_verify(&verifier_state.wots_pk_p, &msg, &arr_sig) {
+        if !verifiable_circuit_babe::wots::wots96_verify(&verifier_state.wots_pk_p, &msg, &arr_sig)
+        {
             return Err("tx_Assert: Wots96 signature verification failed".to_string());
         }
 
@@ -224,10 +237,16 @@ impl BabeBundleBuilder {
         // This E2E continues to the challenge path to exercise it end-to-end regardless.
         println!("Verifier: recovering and verifying Groth16 proof from tx_Assert...");
         match assert_witness.try_recover_pi1_xd() {
-            None => return Err("tx_Assert: witness is not in correct format (π₁ or x_d malformed)".to_string()),
+            None => {
+                return Err(
+                    "tx_Assert: witness is not in correct format (π₁ or x_d malformed)".to_string()
+                )
+            }
             Some(_) => {
-                if assert_witness.verify_groth16_proof(&vk, &[static_public_inputs]) {
-                    println!("Verifier: Groth16 proof is valid — no challenge needed in production.");
+                if assert_witness.verify_groth16_proof(&vk, &static_public_inputs) {
+                    println!(
+                        "Verifier: Groth16 proof is valid — no challenge needed in production."
+                    );
                 } else {
                     return Err("tx_Assert: Groth16 proof failed to verify".to_string());
                 }
@@ -235,28 +254,23 @@ impl BabeBundleBuilder {
         }
 
         // ChallengeAssert: Verifier verifies Wots sig and reveals base-instance labels.
-        let challenge_assert_witness = babe_verifier_challenge_assert_cac(
-            &assert_witness,
-            &verifier_state,
-        )
-        .ok_or_else(|| "invalid Wots96 signature in assert witness".to_string())?;
+        let challenge_assert_witness =
+            babe_verifier_challenge_assert_cac(&assert_witness, &verifier_state)
+                .ok_or_else(|| "invalid Wots96 signature in assert witness".to_string())?;
         println!("Verifier: posting tx_ChallengeAssert...");
         println!("tx_ChallengeAssert witness:   {} bytes", challenge_assert_witness.size_bytes());
 
         println!("Script: checking the valid of Verifier labels...");
         // WronglyChallenged: Prover evaluates GC (base first, then non-base if needed).
         println!("Prover: Finding msg...");
-        let (wrongly_challenged_witness, instance_id) =
-            babe_prover_wrongly_challenged_cac(
-                &vk,
-                dynamic_public_inputs,
-                &challenge_assert_witness,
-                &proof,
-                &prover_state,
-            )
-                .ok_or_else(|| {
-                    "failed to recover a valid wrongly-challenged message".to_string()
-                })?;
+        let (wrongly_challenged_witness, instance_id) = babe_prover_wrongly_challenged_cac(
+            &vk,
+            dynamic_public_inputs,
+            &challenge_assert_witness,
+            &proof,
+            &prover_state,
+        )
+        .ok_or_else(|| "failed to recover a valid wrongly-challenged message".to_string())?;
         println!("Prover: posting tx_WronglyChallenged...");
         println!("tx_WronglyChallenged witness: {} bytes", wrongly_challenged_witness.size_bytes());
 

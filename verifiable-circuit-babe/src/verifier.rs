@@ -1,15 +1,15 @@
-use ark_bn254::{Fr, G1Affine};
-use ark_groth16::VerifyingKey as Groth16VerifyingKey;
-use garbled_snark_verifier::bag::S;
-use garbled_snark_verifier::dv_bn254::fq::Fq as DvFq;
-use garbled_snark_verifier::dv_bn254::fr::Fr as DvFr;
-use serde::{Deserialize, Serialize};
 use crate::cac::CACSetupPackage;
 use crate::dre::N_PADDED;
 use crate::gc::SGC_PART1_CONSTANT_SIZE;
 use crate::instance::CACInstance;
 use crate::instance::commit::CACInstanceCommit;
 use crate::instance::secret::Seed;
+use ark_bn254::{Fr, G1Affine};
+use ark_groth16::VerifyingKey as Groth16VerifyingKey;
+use garbled_snark_verifier::bag::S;
+use garbled_snark_verifier::dv_bn254::fq::Fq as DvFq;
+use garbled_snark_verifier::dv_bn254::fr::Fr as DvFr;
+use serde::{Deserialize, Serialize};
 
 /// Instances processed in parallel per batch (RAM gate).
 /// Override via CAC_BATCH_SIZE env var at runtime.
@@ -30,8 +30,11 @@ impl InstanceLightSecrets {
 
     pub fn compute_pi1_labels(&self, pi1: G1Affine) -> Vec<S> {
         let delta = self.delta[0];
-        DvFq::to_bits(pi1.x).into_iter().chain([false, false])
-            .chain(DvFq::to_bits(pi1.y)).chain([false, false])
+        DvFq::to_bits(pi1.x)
+            .into_iter()
+            .chain([false, false])
+            .chain(DvFq::to_bits(pi1.y))
+            .chain([false, false])
             .enumerate()
             .map(|(i, b)| {
                 let key = self.input_0labels[0][i];
@@ -42,7 +45,9 @@ impl InstanceLightSecrets {
 
     pub fn compute_x_d_labels(&self, x_d: Fr) -> Vec<S> {
         let delta = self.delta[1];
-        DvFr::to_bits(x_d).into_iter().chain([false, false])
+        DvFr::to_bits(x_d)
+            .into_iter()
+            .chain([false, false])
             .enumerate()
             .map(|(i, b)| {
                 let key = self.input_0labels[1][i];
@@ -77,7 +82,8 @@ pub struct BABEVerifier {
     seeds: Vec<Seed>,
     commits: CACSetupPackage,
     vk: Groth16VerifyingKey<ark_bn254::Bn254>,
-    static_public_inputs: Fr,
+    /// Every public input except the dynamic one, in circuit order (Ziren v2.0: `[vkey_hash, vk_root]`).
+    static_public_inputs: Vec<Fr>,
 }
 
 impl BABEVerifier {
@@ -85,7 +91,7 @@ impl BABEVerifier {
     pub fn new(
         n_cc: usize,
         vk: &Groth16VerifyingKey<ark_bn254::Bn254>,
-        static_public_inputs: Fr,
+        static_public_inputs: &[Fr],
     ) -> Result<Self, String> {
         use p3_maybe_rayon::prelude::*;
 
@@ -109,17 +115,15 @@ impl BABEVerifier {
         for batch_seeds in seeds.chunks(batch_size) {
             // Generate up to BATCH_SIZE instances in parallel. For each instance,
             // stream-hash the ciphertexts and adaptor table without materializing them.
-            let batch_results: Vec<Result<CACInstanceCommit, String>> =
-                pool.install(|| {
-                    batch_seeds
-                        .par_iter()
-                        .map(|&seed| {
-                            let commit =
-                                CACInstance::commit_from_seed(seed, vk, static_public_inputs)?;
-                            Ok(commit)
-                        })
-                        .collect()
-                });
+            let batch_results: Vec<Result<CACInstanceCommit, String>> = pool.install(|| {
+                batch_seeds
+                    .par_iter()
+                    .map(|&seed| {
+                        let commit = CACInstance::commit_from_seed(seed, vk, static_public_inputs)?;
+                        Ok(commit)
+                    })
+                    .collect()
+            });
 
             for result in batch_results {
                 commits.push(result?);
@@ -130,7 +134,7 @@ impl BABEVerifier {
             seeds,
             commits,
             vk: vk.clone(),
-            static_public_inputs,
+            static_public_inputs: static_public_inputs.to_vec(),
         })
     }
 
@@ -139,7 +143,7 @@ impl BABEVerifier {
         seeds: &[Seed],
         commits: &CACSetupPackage,
         vk: &Groth16VerifyingKey<ark_bn254::Bn254>,
-        static_public_inputs: Fr,
+        static_public_inputs: &[Fr],
     ) -> Option<Self> {
         if seeds.len() != commits.commits.len() {
             return None;
@@ -148,9 +152,8 @@ impl BABEVerifier {
             seeds: seeds.to_vec(),
             commits: commits.clone(),
             vk: vk.clone(),
-            static_public_inputs
+            static_public_inputs: static_public_inputs.to_vec(),
         })
-
     }
 
     /// Return the C&C commit package from pre-computed commitments.
@@ -179,16 +182,9 @@ impl BABEVerifier {
             .par_iter()
             .map(|&i| {
                 let seed = self.seeds.get(i).ok_or_else(|| {
-                    format!(
-                        "instance {i}: index out of range ({} seeds)",
-                        self.seeds.len()
-                    )
+                    format!("instance {i}: index out of range ({} seeds)", self.seeds.len())
                 })?;
-                let inst = CACInstance::new_from_seed(
-                    *seed,
-                    &self.vk,
-                    self.static_public_inputs,
-                )?;
+                let inst = CACInstance::new_from_seed(*seed, &self.vk, &self.static_public_inputs)?;
 
                 let constant_labels_0 = [
                     inst.secrets.constant_0labels[0][0],
@@ -249,14 +245,14 @@ impl BABEVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::UniformRand;
-    use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
-    use rand::SeedableRng;
     use crate::babe::DummyMulCircuit;
     use crate::cac::CACSetupPackage;
     use crate::instance::commit::CACInstanceCommit;
     use crate::prover::GROTH_16_SEED;
     use crate::utils::pi1_xd_to_wots96_msg;
+    use ark_crypto_primitives::snark::CircuitSpecificSetupSNARK;
+    use ark_ff::UniformRand;
+    use rand::SeedableRng;
 
     fn test_seed(b: u8) -> Seed {
         let mut s = [0u8; 32];
@@ -269,8 +265,10 @@ mod tests {
         let a = Fr::from(3u64);
         let b = Fr::from(7u64);
         let (_, vk) = ark_groth16::Groth16::<ark_bn254::Bn254>::setup(
-            DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) }, &mut rng,
-        ).expect("groth16 setup");
+            DummyMulCircuit::<Fr> { a: Some(a), b: Some(b) },
+            &mut rng,
+        )
+        .expect("groth16 setup");
         vk
     }
 
@@ -317,15 +315,16 @@ mod tests {
 
         let seeds3 = [test_seed(1), test_seed(2), test_seed(3)];
         let seeds2 = [test_seed(1), test_seed(2)];
-        assert!(BABEVerifier::from_state(&seeds3, &commits, &vk, Fr::from(0u64)).is_none());
-        assert!(BABEVerifier::from_state(&seeds2, &commits, &vk, Fr::from(0u64)).is_some());
+        assert!(BABEVerifier::from_state(&seeds3, &commits, &vk, &[Fr::from(0u64)]).is_none());
+        assert!(BABEVerifier::from_state(&seeds2, &commits, &vk, &[Fr::from(0u64)]).is_some());
     }
 
     #[test]
     fn test_open_rejects_out_of_range_index() {
         let vk = dummy_vk();
         let commits = CACSetupPackage { commits: vec![dummy_commit()] };
-        let verifier = BABEVerifier::from_state(&[test_seed(1)], &commits, &vk, Fr::from(0u64)).unwrap();
+        let verifier =
+            BABEVerifier::from_state(&[test_seed(1)], &commits, &vk, &[Fr::from(0u64)]).unwrap();
 
         let err = verifier.open(&[5]).expect_err("index 5 is out of range for 1 seed");
         assert!(err.contains('5'), "error should reference the bad index: {err}");
